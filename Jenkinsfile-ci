@@ -1,0 +1,108 @@
+def COMMIT_ID
+def ZIP_FILE_NAME
+
+pipeline {
+    agent any
+    environment {
+        PHP_VERSION = "8.1.29 "
+        COMPOSER_VERSION = "2.7.7"
+        NEXUS_CREDENTIALS_ID = 'nexus-jenkins'
+        NEXUS_URL = 'https://nexus.u-cloudsolutions.xyz'
+        NEXUS_REPOSITORY = 'student-repository'
+        GROUP_ID = 'com.artificial.lumen'
+        ARTIFACT_ID = 'artifact'
+    }
+    stages { 
+        stage('Checkout') {
+            steps {
+                script {
+                    checkout([$class: 'GitSCM',
+                        branches: [[name: "main"]],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [],
+                        submoduleCfg: [],
+                        userRemoteConfigs: [[credentialsId: 'authentification-gitlab', url: 'https://gitlab.u-cloudsolutions.xyz/summary-internship/2024/wissem-sghaier/my-lumen-app.git']]
+                    ]) 
+                    sh "git rev-parse --short HEAD > commit_hash.txt"
+                    COMMIT_ID = readFile('commit_hash.txt').trim()
+                    ZIP_FILE_NAME = "${ARTIFACT_ID}-${COMMIT_ID}.zip"
+                    echo "Commit Hash: ${COMMIT_ID}"
+                    echo "Zip File Name: ${ZIP_FILE_NAME}"
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                script {
+                    
+                        sh 'composer update'
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                script {
+                    // Run unit tests with PHPUnit
+                    sh '''
+                        ./vendor/bin/phpunit --filter ExampleTest
+                    '''
+                }
+            }
+        }
+        stage('Code Quality Check via SonarQube') {
+            steps {
+                script {
+                    def scannerHome = tool 'sonarqube-scanner'
+                    withSonarQubeEnv('sonarqube-container') {
+                        sh """
+                        ${scannerHome}/bin/sonar-scanner \
+                        -Dsonar.projectKey=lumen-project \
+                        -Dsonar.projectName=lumen-project \
+                        -Dsonar.sources=. \
+                        -Dsonar.host.url=https://sonarqube.u-cloudsolutions.xyz \
+                        -Dsonar.login=squ_b730e6c811798750f5442b5ec90950a58600c316 \
+                        -Dsonar.exclusions=vendor/**
+                        """
+                    }
+                }
+            }
+        }
+        stage("Quality Gate") {
+            steps {
+                sleep 60
+                waitForQualityGate abortPipeline: true
+            }
+        }
+        stage('Package Project') {
+            steps {
+                script {
+                    echo "Packaging project as ${ZIP_FILE_NAME}..."
+                    sh "sudo apt-get install -y zip"
+                    echo "Packaging project as ${ARTIFACT_ID}-${COMMIT_ID}.zip..."
+                    sh """
+                        zip -r ${ZIP_FILE_NAME} .
+                    """
+                }
+            }
+        }
+        stage('Upload to Nexus') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: NEXUS_CREDENTIALS_ID, usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+                    script {
+                        def zipFileName = "${ARTIFACT_ID}-${COMMIT_ID}.zip"
+                        def uploadUrl = "${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${GROUP_ID.replace('.', '/')}/${ARTIFACT_ID}/${COMMIT_ID}/${zipFileName}"
+                        
+                        echo "Uploading ${zipFileName} to Nexus..."
+                        sh """
+                        curl -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} \
+                             --upload-file ${zipFileName} \
+                             "${uploadUrl}"
+                        """
+                    }
+                }
+            }
+        }
+    }
+}

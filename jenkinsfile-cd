@@ -1,0 +1,239 @@
+def COMMIT_ID
+def ZIP_FILE_NAME
+pipeline {
+    agent any 
+    parameters {
+    string(name:'COMMIT_ID', defaultValue: '', description: 'Version tag')
+  } 
+    environment {
+        PHP_VERSION = "8.1.29 "
+        COMPOSER_VERSION = "2.7.7"
+        NEXUS_CREDENTIALS_ID = 'nexus-jenkins'
+        NEXUS_URL = 'https://nexus.u-cloudsolutions.xyz'
+        NEXUS_DOCKER_REPOSITORY = 'new-image-repository'
+        NEXUS_REPOSITORY = 'student-repository'
+        GROUP_ID = 'com.artificial.lumen'
+        ARTIFACT_ID = 'artifact'
+        JMETER_HOME = '/opt/apache-jmeter'  // Set the path to JMeter installation
+        JMETER_TEST_FILE = 'unzip_dir/tests/jmeter/performance-test.jmx'
+        JMETER_TEST_FILE_TMP = 'performance-test.jmx' // Nom du fichier dans le conteneur
+        JMETER_IMAGE_TAG = 'your-jmeter-image:latest'  // Docker image tag
+        
+
+
+    }
+    stages {
+
+        stage('Check Nexus Tag') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    echo "Commit ID: ${commitId}"
+
+                    def url = "${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${GROUP_ID.replace('.', '/')}/${ARTIFACT_ID}/${commitId}/${ARTIFACT_ID}-${commitId}.zip"
+                    echo "Checking URL: ${url}"
+
+                    def response = sh(script: "curl -sS -o /dev/null -w '%{http_code}' ${url}", returnStdout: true).trim()
+                    echo "HTTP Response Code: ${response}"
+
+                    if (response == '404') {
+                        error "Version tag '${commitId}' does not exist in Nexus for artifact '${GROUP_ID}:${ARTIFACT_ID}'"
+                    } else {
+                        echo "Version tag '${commitId}' exists in Nexus for artifact '${GROUP_ID}:${ARTIFACT_ID}'"
+                    }
+                }
+            }
+        }
+        stage('Pull Code from Nexus') {
+            steps {
+                script {
+                    def commit = params.COMMIT_ID
+                    def zipFileName = "${ARTIFACT_ID}-${commit}.zip"
+                    def downloadUrl = "${NEXUS_URL}/repository/${NEXUS_REPOSITORY}/${GROUP_ID.replace('.', '/')}/${ARTIFACT_ID}/${commit}/${zipFileName}"
+
+                    echo "Downloading artifact from Nexus at URL: ${downloadUrl}"
+
+                    withCredentials([usernamePassword(credentialsId: NEXUS_CREDENTIALS_ID, usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+                        sh """
+                            curl -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} -o ${zipFileName} "${downloadUrl}"
+                        """
+                    }
+                }
+            }
+        }
+        stage('Unzip Artifact') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def zipFileName = "${ARTIFACT_ID}-${commitId}.zip"
+                    def unzipDir = "unzip_dir"
+
+                    echo "Unzipping artifact: ${zipFileName}"
+
+                    sh """
+                        mkdir -p ${unzipDir}
+                        unzip -o ${zipFileName} -d ${unzipDir}
+                    """
+                }
+            }
+        }
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def dockerImageName = "my-app:${commitId}"
+                    def dockerfilePath = "Project-Lumen/Dockerfile"
+                    def unzipDir = "unzip_dir"
+
+                    echo "Building Docker image: ${dockerImageName} from Dockerfile at ${dockerfilePath}"
+
+                    sh """
+                        chown -R jenkins:jenkins ${unzipDir}
+                        docker build -t ${dockerImageName} -f ${dockerfilePath} ${unzipDir}
+                    """
+                }
+            }
+        }
+        stage('Publish Docker Image to Nexus') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def dockerImageName = "my-app:${commitId}"
+                    def nexusDockerUrl = "127.0.1.1:10001/repository/${NEXUS_DOCKER_REPOSITORY}"
+
+                    echo "Publishing Docker image: ${dockerImageName} to Nexus Docker repository"
+
+                    withCredentials([usernamePassword(credentialsId: NEXUS_CREDENTIALS_ID, usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+                        sh """
+                            docker login 127.0.1.1:10001 -u ${NEXUS_USERNAME} -p ${NEXUS_PASSWORD}
+                            docker tag ${dockerImageName} ${nexusDockerUrl}/${dockerImageName}
+                            docker push ${nexusDockerUrl}/${dockerImageName}
+                        """
+                    }
+                }
+            }
+        }
+        stage('Run Docker Container') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def dockerImageName = "my-app:${commitId}"
+                    def containerName = "my-container-${commitId}"
+                    def hostPort = "9098"  // Changed host port
+                    def containerPort = "9095"
+
+                    echo "Running Docker container from image: ${dockerImageName}"
+
+                    // Optionally remove any existing container with the same name
+                    sh """
+                        docker rm -f ${containerName} || true
+                    """
+
+                    // Run the Docker container with port mapping
+                    sh """
+                        docker run -d --name ${containerName} -p ${hostPort}:${containerPort} ${dockerImageName}
+                    """
+                }
+            }
+        }
+
+        stage('Build JMeter Docker Image') {
+            steps {
+                script {
+                    echo "Building JMeter Docker image"
+
+                    // Navigate to the directory containing the Dockerfile
+                    dir('Project-GO-GIN') {
+                        // Confirm current working directory
+                        sh 'pwd'
+                
+                        // List files to confirm presence of Dockerfile
+                        sh 'ls -l'
+                
+                        // Build Docker image using the Dockerfile in the current directory
+                        sh """
+                            docker build -t ${JMETER_IMAGE_TAG} -f dockerfile .
+                        """
+                    }
+                }
+            }
+        }
+        stage('Verify Workspace Contents') {
+            steps {
+                script {
+                    echo "Listing contents of the workspace"
+                    sh 'ls -l ${WORKSPACE}'
+                    sh 'find ${WORKSPACE} -name "performance-test.jmx"'
+                }
+            }
+        }
+        stage('Preparation') {
+            steps {
+                script {
+                    echo "Checking if JMeter test file exists..."
+
+                    // Vérifiez si le fichier existe dans l'espace de travail
+                    sh """
+                        if [ ! -f ${WORKSPACE}/${JMETER_TEST_FILE} ]; then
+                            echo "Test file ${JMETER_TEST_FILE} not found in ${WORKSPACE}"
+                            exit 1
+                        else
+                            echo "Test file ${JMETER_TEST_FILE} found."
+                        fi
+                    """
+                }
+            }
+        }
+        stage('Run JMeter Performance Test') {
+            steps {
+                script {
+                    echo "Starting JMeter performance tests"
+
+                    // Exécuter les tests JMeter à l'intérieur du conteneur
+                    docker.image("${JMETER_IMAGE_TAG}").inside {
+                        // Créer le répertoire cible avant de copier le fichier
+                        sh """
+                            mkdir -p /tmp/unzip_dir/tests/jmeter
+                        """
+
+                        // Copier le fichier de test JMeter depuis l'espace de travail Jenkins dans le conteneur
+                        sh """
+                            cp ${WORKSPACE}/${JMETER_TEST_FILE} /tmp/unzip_dir/tests/jmeter/${JMETER_TEST_FILE_TMP}
+                        """
+
+                        // Exécuter le test JMeter
+                        sh """
+                            jmeter -n -t /tmp/unzip_dir/tests/jmeter/${JMETER_TEST_FILE_TMP} -l /tmp/jmeter-results.jtl
+                        """
+                    
+                        // Copier les résultats de retour dans l'espace de travail Jenkins
+                        sh """
+                            cp /tmp/jmeter-results.jtl ${WORKSPACE}/jmeter-results.jtl
+                        """
+                    }
+
+                    // Archiver les résultats pour une analyse ultérieure
+                    archiveArtifacts artifacts: 'jmeter-results.jtl', allowEmptyArchive: true
+                }
+            }
+        }
+
+
+        stage('Stop and Remove Docker Container') {
+            steps {
+                script {
+                    def commitId = params.COMMIT_ID
+                    def containerName = "my-container-${commitId}"
+
+                    echo "Stopping Docker container: ${containerName}"
+
+                    // Stop and remove the Docker container
+                    sh """
+                        docker stop ${containerName} || true
+                        docker rm ${containerName} || true
+                    """
+                }
+            }
+        }
+    }
+}
